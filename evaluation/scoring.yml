@@ -1,0 +1,8 @@
+version: "1.0"
+weights:
+  cli_state: 0.15
+  execution_logging: 0.20
+  idempotency: 0.15
+  backoff_dlq: 0.20
+  visibility_crash_recovery: 0.20
+  concurrency_mutex: 0.10

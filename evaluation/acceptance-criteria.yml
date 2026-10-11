@@ -1,0 +1,59 @@
+- id: CLI-001
+  requirement: "enqueue command creates a pending job record with pinned schema in state.json"
+  test: 01_cli_state.test.ts::enqueue_creates_pending_job
+  weight_category: cli_state
+
+- id: CLI-002
+  requirement: "inspect returns JSON formatted status counts"
+  test: 01_cli_state.test.ts::inspect_returns_counts
+  weight_category: cli_state
+
+- id: CLI-003
+  requirement: "state dump writes complete state.json copy to specified file"
+  test: 01_cli_state.test.ts::state_dump_file
+  weight_category: cli_state
+
+- id: EXEC-001
+  requirement: "worker run-once claims pending job and executes payload command"
+  test: 02_execution.test.ts::worker_executes_payload
+  weight_category: execution_logging
+
+- id: EXEC-002
+  requirement: "worker appends stdout and stderr log outputs to logs/<job_id>.log"
+  test: 02_execution.test.ts::worker_writes_logs
+  weight_category: execution_logging
+
+- id: IDEM-001
+  requirement: "duplicate enqueue with same idempotency key returns existing job ID without creating duplicate"
+  test: 03_idempotency.test.ts::idempotency_key_deduplication
+  weight_category: idempotency
+
+- id: IDEM-002
+  requirement: "re-enqueueing dead-letter job with same idempotency key requires --force flag"
+  test: 03_idempotency.test.ts::dead_letter_idempotency_force
+  weight_category: idempotency
+
+- id: RETRY-001
+  requirement: "failed job retries use exponential backoff math 1000 * 2^(attempt-1)"
+  test: 04_backoff_dlq.test.ts::exponential_backoff_calculation
+  weight_category: backoff_dlq
+
+- id: RETRY-002
+  requirement: "job exceeding max_retries transitions state to dead_letter"
+  test: 04_backoff_dlq.test.ts::max_retries_dead_letter_transition
+  weight_category: backoff_dlq
+
+- id: RETRY-003
+  requirement: "administrative retry command resets attempts to 0 and re-enqueues job"
+  test: 04_backoff_dlq.test.ts::admin_retry_command
+  weight_category: backoff_dlq
+
+- id: RECOVER-001
+  requirement: "expired visibility lock after SIGKILL is reclaimed by subsequent worker run"
+  test: 05_crash_recovery.test.ts::sigkill_visibility_timeout_reclaim
+  weight_category: visibility_crash_recovery
+
+- id: CONCUR-001
+  requirement: "worker run-once respects active lock files and does not claim processing job"
+  test: 06_concurrency.test.ts::deterministic_lock_contention
+  weight_category: concurrency_mutex

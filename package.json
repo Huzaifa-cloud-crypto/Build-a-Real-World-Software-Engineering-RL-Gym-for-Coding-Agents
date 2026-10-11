@@ -1,0 +1,19 @@
+{
+  "name": "rl-gym-job-scheduler",
+  "version": "0.1.0",
+  "private": true,
+  "description": "RL Gym evaluation task for autonomous AI coding agents: Distributed Job Scheduler",
+  "scripts": {
+    "build": "cd reference && npm run build && cd ../evaluation && npm run build",
+    "generate": "node ./evaluation/dist/src/generate_runner.js",
+    "score": "node ./evaluation/dist/src/test_runner.js",
+    "check:mutants": "node ./evaluation/dist/src/check_mutants.js",
+    "check:reference": "node ./evaluation/dist/src/test_runner.js ./reference/dist/cli.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.0"
+  }
+}

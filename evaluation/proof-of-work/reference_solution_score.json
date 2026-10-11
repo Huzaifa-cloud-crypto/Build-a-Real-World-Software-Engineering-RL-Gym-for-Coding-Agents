@@ -1,0 +1,80 @@
+{
+  "timestamp": "2026-10-11T10:14:03.778Z",
+  "target": "reference_solution",
+  "score": 1,
+  "pass_rate": "100%",
+  "details": [
+    {
+      "id": "CLI-001",
+      "name": "enqueue_creates_pending_job",
+      "category": "cli_state",
+      "passed": true
+    },
+    {
+      "id": "CLI-002",
+      "name": "inspect_returns_counts",
+      "category": "cli_state",
+      "passed": true
+    },
+    {
+      "id": "CLI-003",
+      "name": "state_dump_file",
+      "category": "cli_state",
+      "passed": true
+    },
+    {
+      "id": "EXEC-001",
+      "name": "worker_executes_payload",
+      "category": "execution_logging",
+      "passed": true
+    },
+    {
+      "id": "EXEC-002",
+      "name": "worker_writes_logs",
+      "category": "execution_logging",
+      "passed": true
+    },
+    {
+      "id": "IDEM-001",
+      "name": "idempotency_key_deduplication",
+      "category": "idempotency",
+      "passed": true
+    },
+    {
+      "id": "IDEM-002",
+      "name": "dead_letter_idempotency_force",
+      "category": "idempotency",
+      "passed": true
+    },
+    {
+      "id": "RETRY-001",
+      "name": "exponential_backoff_calculation",
+      "category": "backoff_dlq",
+      "passed": true
+    },
+    {
+      "id": "RETRY-002",
+      "name": "max_retries_dead_letter_transition",
+      "category": "backoff_dlq",
+      "passed": true
+    },
+    {
+      "id": "RETRY-003",
+      "name": "admin_retry_command",
+      "category": "backoff_dlq",
+      "passed": true
+    },
+    {
+      "id": "RECOVER-001",
+      "name": "sigkill_visibility_timeout_reclaim",
+      "category": "visibility_crash_recovery",
+      "passed": true
+    },
+    {
+      "id": "CONCUR-001",
+      "name": "deterministic_lock_contention",
+      "category": "concurrency_mutex",
+      "passed": true
+    }
+  ]
+}

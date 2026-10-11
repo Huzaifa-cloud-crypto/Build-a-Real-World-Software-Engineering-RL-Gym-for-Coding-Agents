@@ -1,0 +1,22 @@
+{
+  "name": "rl-gym-job-scheduler-evaluation",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "test": "node dist/src/test_runner.js",
+    "test:mutants": "node dist/src/check_mutants.js",
+    "eval:external": "node dist/scripts/run_external_eval.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.126.0",
+    "dotenv": "^18.0.0",
+    "js-yaml": "^4.1.0",
+    "openai": "^7.18.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}

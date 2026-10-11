@@ -1,0 +1,19 @@
+{
+  "name": "rl-gym-job-scheduler-reference",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/cli.js",
+  "bin": {
+    "job-queue": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "commander": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}

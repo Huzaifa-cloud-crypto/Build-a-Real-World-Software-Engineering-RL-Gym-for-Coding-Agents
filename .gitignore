@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.queue_data/
+.tmp/
+.DS_Store
+Thumbs.db
+.env
+.mutant_test_dir/
+.test_scratch_*
+temp_model_run/

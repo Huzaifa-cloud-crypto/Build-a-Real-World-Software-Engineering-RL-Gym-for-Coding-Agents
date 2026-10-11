@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-10-11T10:14:03.780Z",
+  "model": "Claude Opus 5 (medium reasoning)",
+  "pass_type": "single-pass",
+  "score": 0.15,
+  "pass_rate": "15.0%",
+  "summary": "Model failed on crash recovery (SIGKILL lock expiration) and idempotency force re-enqueue semantics.",
+  "failed_categories": [
+    "visibility_crash_recovery",
+    "idempotency",
+    "concurrency_mutex"
+  ],
+  "details": [
+    {
+      "id": "CLI-001",
+      "passed": true
+    },
+    {
+      "id": "CLI-002",
+      "passed": true
+    },
+    {
+      "id": "EXEC-001",
+      "passed": false
+    },
+    {
+      "id": "IDEM-001",
+      "passed": false
+    },
+    {
+      "id": "RECOVER-001",
+      "passed": false
+    }
+  ]
+}
