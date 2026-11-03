@@ -1,354 +1,362 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { execSync } from 'child_process';
+import { spawnSync, execSync } from 'child_process';
 import dotenv from 'dotenv';
-import OpenAI from 'openai';
+import { runEvaluation } from '../src/test_runner';
+import * as yaml from 'js-yaml';
 
-// Load .env from root workspace directory
-const rootDir = path.resolve(__dirname, '../..');
-const envPath = path.join(rootDir, '.env');
-dotenv.config({ path: envPath });
+/**
+ * Single-pass model evaluation driver.
+ *
+ * Runs each configured frontier model once, through OpenHands as the agent
+ * harness, against task/instruction.md inside a sandbox that contains no
+ * verifier assets. Builds whatever the agent produced, scores it with the
+ * private verifier, and records only measured results.
+ *
+ * Nothing here synthesises a score. If a run fails, the failure is recorded
+ * with a null score and the process exits non-zero.
+ */
+
+// Compiled to evaluation/dist/scripts/, so the repo root is three levels up.
+const rootDir = path.resolve(__dirname, '../../..');
+dotenv.config({ path: path.join(rootDir, '.env') });
 
 const instructionPath = path.join(rootDir, 'task', 'instruction.md');
-const instructionText = fs.readFileSync(instructionPath, 'utf-8');
+const powDir = path.join(rootDir, 'evaluation', 'proof-of-work');
+const runRoot = path.join(rootDir, 'temp_model_run');
 
-const promptText = `You are an AI coding agent being evaluated on a repository-level software engineering benchmark.
-Read the problem specification below carefully and implement the complete solution as a production-quality Node.js / TypeScript repository.
+const DIFFICULTY_BAR = 0.30;
 
-IMPORTANT OUTPUT FORMAT INSTRUCTIONS:
-Provide all necessary project files (including package.json, tsconfig.json, source files).
-Format each file inside a markdown code block with the relative file path specified on the first line or block header, for example:
-
-\`\`\`typescript src/cli.ts
-// file content here
-\`\`\`
-
-\`\`\`json package.json
-// package.json content here
-\`\`\`
-
-Do not leave any placeholder or incomplete code. Make sure the code compiles with \`npx tsc\` and provides the required CLI interface.
-
---- BEGIN SPECIFICATION ---
-${instructionText}
---- END SPECIFICATION ---`;
+type RunStatus = 'COMPLETED' | 'HARNESS_MISSING' | 'AGENT_FAILED' | 'BUILD_FAILED' | 'CONFIG_ERROR';
 
 interface ModelRunResult {
   model: string;
   modelId: string;
-  status: string;
-  buildStatus: 'SUCCESS' | 'BUILD_FAILED' | 'API_ERROR';
-  score: number;
-  apiError?: string;
-  rawOutput?: string;
-  buildError?: string;
-  verifierResults?: any[];
+  harness: string;
+  command: string;
+  status: RunStatus;
+  buildStatus: 'SUCCESS' | 'FAILED' | 'NOT_ATTEMPTED';
+  score: number | null;
+  exitCode: number | null;
+  passedTests: string[];
+  failedTests: string[];
+  failedCategories: string[];
+  agentLog: string | null;
+  error: string | null;
+  timestamp: string;
 }
 
-function parseAndExtractFiles(responseText: string, outputDir: string): boolean {
-  if (fs.existsSync(outputDir)) {
-    fs.rmSync(outputDir, { recursive: true, force: true });
+function parseModelList(): Array<{ model: string; modelId: string }> {
+  const raw = process.env.EVAL_MODELS;
+  if (!raw || !raw.trim()) {
+    throw new Error(
+      'EVAL_MODELS is not set. Provide two frontier model ids, comma separated, e.g.\n' +
+      '  EVAL_MODELS="anthropic/claude-opus-5,openai/gpt-5.6-sol"'
+    );
   }
-  fs.mkdirSync(outputDir, { recursive: true });
-
-  const codeBlockRegex = /```(?:[a-zA-Z0-9_-]+)?(?:\s+([^\n]+))?\n([\s\S]*?)```/g;
-  let match;
-  let fileCount = 0;
-
-  while ((match = codeBlockRegex.exec(responseText)) !== null) {
-    let headerLine = (match[1] || '').trim();
-    let content = match[2];
-
-    let filePath: string | null = null;
-    if (headerLine && !headerLine.includes(' ') && (headerLine.includes('.') || headerLine.includes('/'))) {
-      filePath = headerLine;
-    } else {
-      // Check first line of content for file path comment like // path/to/file.ts or // file: path/to/file.ts
-      const firstLine = content.split('\n')[0].trim();
-      const fileCommentMatch = firstLine.match(/\/\/\s*(?:file:)?\s*([a-zA-Z0-9_\-\.\/]+)/i) ||
-                                firstLine.match(/\/\*\s*(?:file:)?\s*([a-zA-Z0-9_\-\.\/]+)/i);
-      if (fileCommentMatch) {
-        filePath = fileCommentMatch[1].trim();
-      }
-    }
-
-    if (!filePath) {
-      if (content.includes('"name":') && content.includes('"dependencies":')) {
-        filePath = 'package.json';
-      } else if (content.includes('"compilerOptions":')) {
-        filePath = 'tsconfig.json';
-      } else if (content.includes('program') && content.includes('commander')) {
-        filePath = 'src/cli.ts';
-      }
-    }
-
-    if (filePath) {
-      const fullPath = path.join(outputDir, filePath);
-      const dir = path.dirname(fullPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(fullPath, content, 'utf-8');
-      fileCount++;
-    }
+  const ids = raw.split(',').map(s => s.trim()).filter(Boolean);
+  if (ids.length !== 2) {
+    throw new Error(`EVAL_MODELS must list exactly two models (got ${ids.length}): the brief requires two different frontier models.`);
   }
-
-  return fileCount > 0;
+  return ids.map(id => ({ model: id, modelId: id }));
 }
 
-function getOpenRouterClient(): OpenAI {
-  const apiKey = process.env.AGENT_ROUTER_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error('API key missing in .env');
+function detectOpenHands(): string | null {
+  const explicit = process.env.OPENHANDS_BIN;
+  if (explicit) {
+    return fs.existsSync(explicit) || !explicit.includes(path.sep) ? explicit : null;
   }
-  return new OpenAI({
-    apiKey,
-    baseURL: 'https://openrouter.ai/api/v1'
-  });
+  for (const candidate of ['openhands', 'openhands-cli']) {
+    const probe = spawnSync(process.platform === 'win32' ? 'where' : 'which', [candidate], { encoding: 'utf-8' });
+    if (probe.status === 0 && probe.stdout.trim()) {
+      return probe.stdout.trim().split(/\r?\n/)[0];
+    }
+  }
+  return null;
 }
 
-async function runModelEval(modelName: string, modelId: string, modelKey: string): Promise<ModelRunResult> {
-  console.log(`\n--> Sending request to model ${modelId} (${modelName})...`);
-
-  try {
-    let responseText = '';
-
-    const openrouterKey = process.env.OPENROUTER_API_KEY || process.env.OPENROUER_API_KEY;
-
-    if (openrouterKey) {
-      console.log(`Using OpenRouter API key for ${modelId}...`);
-      const client = new OpenAI({
-        apiKey: openrouterKey,
-        baseURL: 'https://openrouter.ai/api/v1',
-        defaultHeaders: {
-          'HTTP-Referer': 'https://github.com',
-          'X-Title': 'RL Gym Benchmark Eval'
-        }
-      });
-      const response = await client.chat.completions.create({
-        model: modelId,
-        max_tokens: 4096,
-        messages: [{ role: 'user', content: promptText }]
-      });
-      responseText = response.choices[0]?.message?.content || '';
-    } else if (modelKey === 'claude') {
-      const anthropicKey = process.env.ANTHROPIC_API_KEY;
-      if (!anthropicKey) {
-        throw new Error('ANTHROPIC_API_KEY / OPENROUTER_API_KEY missing in .env');
-      }
-
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': anthropicKey,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify({
-          model: 'claude-3-5-sonnet-20241022',
-          max_tokens: 4096,
-          messages: [{ role: 'user', content: promptText }]
-        })
-      });
-
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`Anthropic API status ${res.status}: ${errText}`);
-      }
-
-      const data: any = await res.json();
-      responseText = data.content?.[0]?.text || '';
-    } else {
-      const openaiKey = process.env.OPENAI_API_KEY;
-      if (!openaiKey) {
-        throw new Error('OPENAI_API_KEY / OPENROUTER_API_KEY missing in .env');
-      }
-
-      const client = new OpenAI({ apiKey: openaiKey });
-      const response = await client.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: promptText }]
-      });
-      responseText = response.choices[0]?.message?.content || '';
-    }
-
-    if (!responseText) {
-      return {
-        model: modelName,
-        modelId,
-        status: 'API_ERROR',
-        buildStatus: 'API_ERROR',
-        score: 0.0,
-        apiError: 'Model returned empty response text.'
-      };
-    }
-
-    console.log(`Received response from ${modelId} (${responseText.length} chars). Extracting and evaluating...`);
-    return evaluateModelOutput(modelName, modelId, modelKey, responseText);
-  } catch (err: any) {
-    console.error(`API Error for ${modelId}:`, err.message || err);
-    return {
-      model: modelName,
-      modelId,
-      status: 'API_ERROR',
-      buildStatus: 'API_ERROR',
-      score: 0.0,
-      apiError: err.message || String(err)
-    };
+function buildCommand(openhandsBin: string, modelId: string, workspace: string, taskFile: string): string {
+  const template = process.env.OPENHANDS_CMD_TEMPLATE;
+  if (template) {
+    return template
+      .replace(/\{bin\}/g, openhandsBin)
+      .replace(/\{model\}/g, modelId)
+      .replace(/\{workspace\}/g, workspace)
+      .replace(/\{task\}/g, taskFile);
   }
+  return `"${openhandsBin}" --headless --model "${modelId}" --workspace "${workspace}" --task-file "${taskFile}"`;
 }
 
-function evaluateModelOutput(modelName: string, modelId: string, modelKey: string, responseText: string): ModelRunResult {
-  const tempDir = path.join(rootDir, 'temp_model_run', modelKey);
-  const extracted = parseAndExtractFiles(responseText, tempDir);
-
-  if (!extracted) {
-    console.log(`Extraction failed for ${modelName}: no files parsed.`);
-    return {
-      model: modelName,
-      modelId,
-      status: 'BUILD_FAILED',
-      buildStatus: 'BUILD_FAILED',
-      score: 0.0,
-      rawOutput: responseText,
-      buildError: 'Failed to extract valid code files from model response.'
-    };
+function prepareWorkspace(slug: string): string {
+  const workspace = path.join(runRoot, slug);
+  if (fs.existsSync(workspace)) {
+    fs.rmSync(workspace, { recursive: true, force: true });
   }
+  fs.mkdirSync(workspace, { recursive: true });
 
-  // Attempt npm install and npm run build
-  try {
-    console.log(`Building extracted code for ${modelName} in ${tempDir}...`);
-    execSync('npm install --silent', { cwd: tempDir, stdio: 'ignore' });
-    execSync('npm run build', { cwd: tempDir, stdio: 'ignore' });
-  } catch (buildErr: any) {
-    console.log(`Build failed for ${modelName}:`, buildErr.message);
-    return {
-      model: modelName,
-      modelId,
-      status: 'BUILD_FAILED',
-      buildStatus: 'BUILD_FAILED',
-      score: 0.0,
-      rawOutput: responseText,
-      buildError: buildErr.message || 'npm run build failed'
-    };
+  // Model-facing material only. The verifier must never be reachable from
+  // the agent's sandbox.
+  fs.cpSync(path.join(rootDir, 'task'), path.join(workspace, 'task'), { recursive: true });
+  fs.writeFileSync(path.join(workspace, 'TASK.md'), fs.readFileSync(instructionPath, 'utf-8'), 'utf-8');
+
+  const leaked = ['evaluation', 'reference'].filter(d => fs.existsSync(path.join(workspace, d)));
+  if (leaked.length) {
+    throw new Error(`Sandbox leaked private assets into the agent workspace: ${leaked.join(', ')}`);
   }
+  return workspace;
+}
 
-  // Find compiled entrypoint
-  const possibleEntrypoints = [
-    path.join(tempDir, 'dist', 'cli.js'),
-    path.join(tempDir, 'dist', 'src', 'cli.js'),
-    path.join(tempDir, 'dist', 'index.js'),
-    path.join(tempDir, 'cli.js')
+function findEntrypoint(workspace: string): string | null {
+  const candidates = [
+    path.join(workspace, 'dist', 'cli.js'),
+    path.join(workspace, 'dist', 'src', 'cli.js'),
+    path.join(workspace, 'reference', 'dist', 'cli.js'),
+    path.join(workspace, 'dist', 'index.js'),
+    path.join(workspace, 'cli.js')
   ];
-  let entrypoint = possibleEntrypoints.find(p => fs.existsSync(p));
+  return candidates.find(p => fs.existsSync(p)) || null;
+}
 
-  if (!entrypoint) {
-    console.log(`Entrypoint dist/cli.js missing for ${modelName}.`);
-    return {
-      model: modelName,
-      modelId,
-      status: 'BUILD_FAILED',
-      buildStatus: 'BUILD_FAILED',
-      score: 0.0,
-      rawOutput: responseText,
-      buildError: 'Compiled entrypoint (dist/cli.js) not found.'
-    };
+function buildAndScore(workspace: string): { buildStatus: 'SUCCESS' | 'FAILED'; entrypoint: string | null; buildError: string | null } {
+  const pkg = path.join(workspace, 'package.json');
+  if (!fs.existsSync(pkg)) {
+    return { buildStatus: 'FAILED', entrypoint: null, buildError: 'Agent produced no package.json.' };
   }
 
-  // Run verifier suite against compiled CLI
-  const { runEvaluation } = require('../src/test_runner');
-  const evalResult = runEvaluation(entrypoint);
+  try {
+    execSync('npm install --silent', { cwd: workspace, stdio: 'pipe', timeout: 600000 });
+  } catch (err: any) {
+    return { buildStatus: 'FAILED', entrypoint: null, buildError: `npm install failed: ${err.message}` };
+  }
 
-  console.log(`Evaluation score for ${modelName}: ${evalResult.score}`);
+  try {
+    execSync('npm run build', { cwd: workspace, stdio: 'pipe', timeout: 600000 });
+  } catch (err: any) {
+    const out = [err.stdout, err.stderr].filter(Boolean).join('\n');
+    return { buildStatus: 'FAILED', entrypoint: null, buildError: `npm run build failed: ${out.slice(0, 4000)}` };
+  }
+
+  const entrypoint = findEntrypoint(workspace);
+  if (!entrypoint) {
+    return { buildStatus: 'FAILED', entrypoint: null, buildError: 'Build succeeded but no compiled CLI entrypoint (dist/cli.js) was found.' };
+  }
+  return { buildStatus: 'SUCCESS', entrypoint, buildError: null };
+}
+
+function categoriseFailures(results: Array<{ id: string; category: string; passed: boolean }>): string[] {
+  return Array.from(new Set(results.filter(r => !r.passed).map(r => r.category))).sort();
+}
+
+function runModel(openhandsBin: string | null, model: string, modelId: string, index: number): ModelRunResult {
+  const timestamp = new Date().toISOString();
+  const base: ModelRunResult = {
+    model, modelId,
+    harness: 'OpenHands (headless, single pass)',
+    command: '',
+    status: 'CONFIG_ERROR',
+    buildStatus: 'NOT_ATTEMPTED',
+    score: null,
+    exitCode: null,
+    passedTests: [],
+    failedTests: [],
+    failedCategories: [],
+    agentLog: null,
+    error: null,
+    timestamp
+  };
+
+  if (!openhandsBin) {
+    return { ...base, status: 'HARNESS_MISSING', error: 'OpenHands CLI not found on PATH. Install it or set OPENHANDS_BIN.' };
+  }
+
+  const slug = `model_${index + 1}_${modelId.replace(/[^a-zA-Z0-9_.-]/g, '_')}`;
+  let workspace: string;
+  try {
+    workspace = prepareWorkspace(slug);
+  } catch (err: any) {
+    return { ...base, status: 'CONFIG_ERROR', error: err.message };
+  }
+
+  const taskFile = path.join(workspace, 'TASK.md');
+  const command = buildCommand(openhandsBin, modelId, workspace, taskFile);
+  const logPath = path.join(workspace, 'openhands_run.log');
+  base.command = command;
+  base.agentLog = logPath;
+
+  console.log(`\n--> [${index + 1}/2] Single-pass OpenHands run: ${modelId}`);
+  console.log(`    workspace: ${workspace}`);
+  console.log(`    command:   ${command}`);
+
+  const agent = spawnSync(command, {
+    shell: true,
+    cwd: workspace,
+    encoding: 'utf-8',
+    timeout: Number(process.env.EVAL_TIMEOUT_MS || 3600000),
+    env: { ...process.env }
+  });
+
+  fs.writeFileSync(logPath, [
+    `# OpenHands single-pass run`,
+    `model: ${modelId}`,
+    `command: ${command}`,
+    `exitCode: ${agent.status}`,
+    ``,
+    `## stdout`,
+    agent.stdout || '',
+    `## stderr`,
+    agent.stderr || ''
+  ].join('\n'), 'utf-8');
+
+  base.exitCode = agent.status;
+
+  if (agent.error) {
+    return { ...base, status: 'AGENT_FAILED', error: `OpenHands invocation failed: ${agent.error.message}` };
+  }
+  if (agent.status !== 0) {
+    return { ...base, status: 'AGENT_FAILED', error: `OpenHands exited ${agent.status}. See ${logPath}` };
+  }
+
+  const built = buildAndScore(workspace);
+  base.buildStatus = built.buildStatus;
+  if (built.buildStatus === 'FAILED' || !built.entrypoint) {
+    return { ...base, status: 'BUILD_FAILED', error: built.buildError };
+  }
+
+  const evalResult = runEvaluation(built.entrypoint);
+  const details = evalResult.results as Array<{ id: string; category: string; passed: boolean }>;
 
   return {
-    model: modelName,
-    modelId,
+    ...base,
     status: 'COMPLETED',
-    buildStatus: 'SUCCESS',
     score: evalResult.score,
-    rawOutput: responseText,
-    verifierResults: evalResult.results
+    passedTests: details.filter(d => d.passed).map(d => d.id),
+    failedTests: details.filter(d => !d.passed).map(d => d.id),
+    failedCategories: categoriseFailures(details)
   };
 }
 
-async function main() {
-  console.log('=== STARTING EXTERNAL MODEL EVALUATION HARNESS ===');
-
-  const claudeResult = await runModelEval(
-    'Claude Opus 5 (medium reasoning)',
-    'anthropic/claude-opus-5',
-    'claude'
+function recordReferenceRun(): { score: number; results: any[] } {
+  const refCli = path.join(rootDir, 'reference', 'dist', 'cli.js');
+  if (!fs.existsSync(refCli)) {
+    throw new Error(`Reference build missing at ${refCli}. Run app-setup/build.sh first.`);
+  }
+  const evalResult = runEvaluation(refCli);
+  fs.writeFileSync(
+    path.join(powDir, 'reference_solution_score.json'),
+    JSON.stringify({ timestamp: new Date().toISOString(), target: 'reference_solution', score: evalResult.score, details: evalResult.results }, null, 2),
+    'utf-8'
   );
-  console.log(`\nClaude Opus 5 Final Result: status=${claudeResult.status}, build=${claudeResult.buildStatus}, score=${claudeResult.score}`);
+  console.log(`Reference solution score: ${evalResult.score}`);
+  return evalResult;
+}
 
-  const gptResult = await runModelEval(
-    'GPT-5.6-sol (medium reasoning)',
-    'openai/gpt-5.6-sol',
-    'gpt'
-  );
-  console.log(`\nGPT-5.6-sol Final Result: status=${gptResult.status}, build=${gptResult.buildStatus}, score=${gptResult.score}`);
+function writeReadme(refScore: number, runs: ModelRunResult[]): void {
+  const measured = runs.filter(r => r.status === 'COMPLETED' && r.score !== null);
+  const barMet = measured.length === 2 && measured.every(r => (r.score as number) < DIFFICULTY_BAR);
 
-  // Record logs in proof-of-work
-  const powDir = path.join(rootDir, 'evaluation', 'proof-of-work');
-  if (!fs.existsSync(powDir)) {
-    fs.mkdirSync(powDir, { recursive: true });
-  }
+  const rows = runs.map(r => {
+    const score = r.score === null ? '`NOT MEASURED`' : `**${r.score.toFixed(2)}**`;
+    const bar = r.score === null ? 'n/a' : (r.score < DIFFICULTY_BAR ? `below ${DIFFICULTY_BAR} — passes` : `at or above ${DIFFICULTY_BAR} — fails`);
+    return `| \`${r.modelId}\` | single-pass | \`${r.status}\` | \`${r.buildStatus}\` | ${score} | ${bar} |`;
+  }).join('\n');
 
-  if (claudeResult.status !== 'API_ERROR') {
-    fs.writeFileSync(
-      path.join(powDir, 'claude_opus_5_eval.json'),
-      JSON.stringify(claudeResult, null, 2),
-      'utf-8'
-    );
-  }
+  const content = `# Proof-of-Work: Model Evaluation Artifacts
 
-  if (gptResult.status !== 'API_ERROR') {
-    fs.writeFileSync(
-      path.join(powDir, 'gpt_5.6_sol_eval.json'),
-      JSON.stringify(gptResult, null, 2),
-      'utf-8'
-    );
-  }
+Every number in this directory is measured by an actual run. Nothing is synthesised.
 
-  // Update README table
-  const readmePath = path.join(powDir, 'README.md');
-  const readmeContent = `# Proof-of-Work: AI Model Evaluation Guide & Execution Logs
+## Artifacts
 
-This directory stores proof-of-work validation artifacts for the **Distributed Job Scheduler** RL Gym benchmark task.
+- \`reference_solution_score.json\` — verifier run against \`reference/\`. Must be \`1.0\`.
+- \`mutant_results.json\` — output of \`npm run check:mutants\`, per-mutant outcome and score drop.
+- \`model_run_<n>_<id>.json\` — one file per evaluated model: exact OpenHands command, exit code, build status, measured score, per-test results, failure categories.
+- \`openhands_run.log\` inside \`temp_model_run/<slug>/\` — full agent transcript per run.
 
----
+## Reference
 
-## 📁 Directory Files
+| Target | Score |
+| :--- | :---: |
+| \`reference/\` | **${refScore}** |
 
-- \`reference_solution_score.json\`: Empirical verifier run log of the reference solution (Score: 1.00 / 100%).
-- \`claude_opus_5_eval.json\`: Empirical evaluation run log for Claude Opus 5 (anthropic/claude-opus-5).
-- \`gpt_5.6_sol_eval.json\`: Empirical evaluation run log for GPT-5.6-sol (openai/gpt-5.6-sol).
-- \`README.md\`: Evaluation protocol, prompt template, scoring procedure, and model benchmark status table.
+## Model runs (single pass, OpenHands harness)
 
----
+| Model ID | Pass Type | Status | Build | Verifier Score | Difficulty Bar (< ${DIFFICULTY_BAR}) |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+${rows}
 
-## 📊 Model Evaluation Summary Table
+**Difficulty bar verdict:** ${barMet
+    ? `MET — both models scored below ${DIFFICULTY_BAR}.`
+    : `NOT MET — ${measured.length}/2 models produced a measured score. A run that did not complete cannot be claimed as evidence.`}
 
-| Model | Model ID | Single-Pass Attempts | Build Status | Verifier Score | Difficulty Bar (< 30%) | Status |
-| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Reference Solution** | \`reference/\` | N/A | \`SUCCESS\` | **1.00 (100%)** | N/A | **VERIFIED** |
-| **Claude Opus 5 (medium reasoning)** | \`anthropic/claude-opus-5\` | 1 | \`${claudeResult.buildStatus}\` | **${claudeResult.score}** | Target: < 0.30 | **${claudeResult.status}** |
-| **GPT-5.6-sol (medium reasoning)** | \`openai/gpt-5.6-sol\` | 1 | \`${gptResult.buildStatus}\` | **${gptResult.score}** | Target: < 0.30 | **${gptResult.status}** |
+## Reproducing
 
----
+\`\`\`bash
+export EVAL_MODELS="<model-a>,<model-b>"   # two different frontier models, medium reasoning
+export OPENHANDS_BIN="$(which openhands)"  # optional; auto-detected on PATH
+# export OPENHANDS_CMD_TEMPLATE='...'      # optional; pin the exact headless invocation
+npm run build && npm run generate
+\`\`\`
 
-## 🎯 Benchmark Summary
-
-- **Claude Opus 5**: Score = **${claudeResult.score}** (${claudeResult.score < 0.30 ? 'Passes difficulty bar < 30%' : 'Requires task hardening'})
-- **GPT-5.6-sol**: Score = **${gptResult.score}** (${gptResult.score < 0.30 ? 'Passes difficulty bar < 30%' : 'Requires task hardening'})
+\`npm run generate\` exits non-zero unless both models completed a single pass and
+both measured scores are below ${DIFFICULTY_BAR}.
 `;
-  fs.writeFileSync(readmePath, readmeContent, 'utf-8');
+  fs.writeFileSync(path.join(powDir, 'README.md'), content, 'utf-8');
+}
+
+async function main(): Promise<void> {
+  console.log('=== SINGLE-PASS MODEL EVALUATION (OpenHands) ===');
+
+  fs.mkdirSync(powDir, { recursive: true });
+  fs.mkdirSync(runRoot, { recursive: true });
+
+  const refEval = recordReferenceRun();
+  if (refEval.score < 1.0) {
+    throw new Error(`Reference solution scores ${refEval.score}, not 1.0. Fix the reference before evaluating models.`);
+  }
+
+  let models: Array<{ model: string; modelId: string }>;
+  try {
+    models = parseModelList();
+  } catch (err: any) {
+    const result: ModelRunResult = {
+      model: 'n/a', modelId: 'n/a', harness: 'OpenHands (headless, single pass)', command: '',
+      status: 'CONFIG_ERROR', buildStatus: 'NOT_ATTEMPTED', score: null, exitCode: null,
+      passedTests: [], failedTests: [], failedCategories: [], agentLog: null,
+      error: err.message, timestamp: new Date().toISOString()
+    };
+    writeReadme(refEval.score, [result, result]);
+    throw err;
+  }
+
+  const openhandsBin = detectOpenHands();
+  if (!openhandsBin) {
+    console.error('OpenHands CLI not found. Install it, or set OPENHANDS_BIN / OPENHANDS_CMD_TEMPLATE.');
+  } else {
+    console.log(`OpenHands harness: ${openhandsBin}`);
+  }
+
+  const runs = models.map((m, i) => runModel(openhandsBin, m.model, m.modelId, i));
+
+  runs.forEach((r, i) => {
+    const file = path.join(powDir, `model_run_${i + 1}_${r.modelId.replace(/[^a-zA-Z0-9_.-]/g, '_')}.json`);
+    fs.writeFileSync(file, JSON.stringify(r, null, 2), 'utf-8');
+    console.log(`\n[${i + 1}/2] ${r.modelId}: status=${r.status} build=${r.buildStatus} score=${r.score === null ? 'NOT MEASURED' : r.score}`);
+    if (r.error) console.error(`      error: ${r.error}`);
+  });
+
+  writeReadme(refEval.score, runs);
+
+  const completed = runs.filter(r => r.status === 'COMPLETED' && r.score !== null);
+  const barMet = completed.length === 2 && completed.every(r => (r.score as number) < DIFFICULTY_BAR);
 
   console.log('\n=== EVALUATION FINISHED ===');
+  if (!barMet) {
+    console.error(`Difficulty bar NOT met: ${completed.length}/2 models produced a measured score below ${DIFFICULTY_BAR}.`);
+    process.exit(1);
+  }
+  console.log(`Difficulty bar met: both models scored below ${DIFFICULTY_BAR} on a single pass.`);
 }
 
 main().catch(err => {
-  console.error('Fatal error in evaluation harness:', err);
+  console.error('Fatal error in evaluation harness:', err.message || err);
   process.exit(1);
 });

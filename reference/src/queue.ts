@@ -17,29 +17,60 @@ export interface EnqueueOptions {
 export function enqueueJob(options: EnqueueOptions): { jobId: string; existing: boolean } {
   const storage = new Storage(options.storeDir);
   const now = getReferenceTime(options.now);
+
+  if (!storage.acquireLock('state')) {
+    throw new Error('Could not acquire queue lock; another process is writing state.');
+  }
+
+  try {
+    return enqueueLocked(storage, options, now);
+  } finally {
+    storage.releaseLock('state');
+  }
+}
+
+function enqueueLocked(storage: Storage, options: EnqueueOptions, now: Date): { jobId: string; existing: boolean } {
   const state = storage.loadState();
 
   const queue = options.queue || 'default';
   const maxRetries = options.maxRetries !== undefined ? Number(options.maxRetries) : 3;
   const idempotencyKey = options.idempotencyKey || null;
   const payload = options.payload || { cmd: 'echo', args: [] };
+  const delayMs = options.delayMs ? Number(options.delayMs) : 0;
+  const runAt = new Date(now.getTime() + delayMs).toISOString();
+  const nowIso = now.toISOString();
 
   if (idempotencyKey) {
     const existingJob = Object.values(state.jobs).find(j => j.idempotency_key === idempotencyKey);
     if (existingJob) {
-      if (existingJob.state === 'dead_letter' && !options.force) {
-        throw new Error(`Job with idempotency key '${idempotencyKey}' is in dead_letter state. Use --force to re-enqueue.`);
+      const terminal = existingJob.state === 'dead_letter' || existingJob.state === 'failed';
+
+      if (terminal && !options.force) {
+        throw new Error(`Job with idempotency key '${idempotencyKey}' is in ${existingJob.state} state. Use --force to re-enqueue.`);
       }
-      if (['pending', 'processing', 'completed'].includes(existingJob.state)) {
+
+      if (!terminal) {
         return { jobId: existingJob.id, existing: true };
       }
+
+      // --force: revive in place. Creating a second job would leave two
+      // records sharing one idempotency key, breaking future deduplication.
+      existingJob.state = 'pending';
+      existingJob.attempts = 0;
+      existingJob.claimed_by = null;
+      existingJob.lock_expires_at = null;
+      existingJob.last_heartbeat_at = null;
+      existingJob.run_at = runAt;
+      existingJob.max_retries = maxRetries;
+      existingJob.queue = queue;
+      existingJob.payload = payload;
+      existingJob.updated_at = nowIso;
+      storage.saveState(state);
+      return { jobId: existingJob.id, existing: true };
     }
   }
 
   const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-  const delayMs = options.delayMs ? Number(options.delayMs) : 0;
-  const runAt = new Date(now.getTime() + delayMs).toISOString();
-  const nowIso = now.toISOString();
 
   const newJob: Job = {
     id: jobId,
@@ -66,28 +97,37 @@ export function enqueueJob(options: EnqueueOptions): { jobId: string; existing: 
 export function retryJob(jobId: string, storeDir?: string, nowArg?: string): Job {
   const storage = new Storage(storeDir);
   const now = getReferenceTime(nowArg);
-  const state = storage.loadState();
 
-  const job = state.jobs[jobId];
-  if (!job) {
-    throw new Error(`Job '${jobId}' not found.`);
+  if (!storage.acquireLock('state')) {
+    throw new Error('Could not acquire queue lock; another process is writing state.');
   }
 
-  if (job.state !== 'failed' && job.state !== 'dead_letter') {
-    throw new Error(`Job '${jobId}' is in state '${job.state}', cannot retry.`);
+  try {
+    const state = storage.loadState();
+    const job = state.jobs[jobId];
+
+    if (!job) {
+      throw new Error(`Job '${jobId}' not found.`);
+    }
+
+    if (job.state !== 'failed' && job.state !== 'dead_letter') {
+      throw new Error(`Job '${jobId}' is in state '${job.state}', cannot retry.`);
+    }
+
+    const nowIso = now.toISOString();
+    job.state = 'pending';
+    job.attempts = 0;
+    job.claimed_by = null;
+    job.lock_expires_at = null;
+    job.last_heartbeat_at = null;
+    job.run_at = nowIso;
+    job.updated_at = nowIso;
+
+    storage.saveState(state);
+    return job;
+  } finally {
+    storage.releaseLock('state');
   }
-
-  const nowIso = now.toISOString();
-  job.state = 'pending';
-  job.attempts = 0;
-  job.claimed_by = null;
-  job.lock_expires_at = null;
-  job.last_heartbeat_at = null;
-  job.run_at = nowIso;
-  job.updated_at = nowIso;
-
-  storage.saveState(state);
-  return job;
 }
 
 export function inspectState(queueFilter?: string, storeDir?: string, nowArg?: string): Record<string, number> {
@@ -120,16 +160,25 @@ export function dumpState(file: string, storeDir?: string): void {
 
 export function purgeJobs(queueFilter?: string, stateFilter?: string, storeDir?: string): number {
   const storage = new Storage(storeDir);
-  const state = storage.loadState();
-  let count = 0;
 
-  for (const [id, job] of Object.entries(state.jobs)) {
-    if (queueFilter && job.queue !== queueFilter) continue;
-    if (stateFilter && job.state !== stateFilter) continue;
-    delete state.jobs[id];
-    count++;
+  if (!storage.acquireLock('state')) {
+    throw new Error('Could not acquire queue lock; another process is writing state.');
   }
 
-  storage.saveState(state);
-  return count;
+  try {
+    const state = storage.loadState();
+    let count = 0;
+
+    for (const [id, job] of Object.entries(state.jobs)) {
+      if (queueFilter && job.queue !== queueFilter) continue;
+      if (stateFilter && job.state !== stateFilter) continue;
+      delete state.jobs[id];
+      count++;
+    }
+
+    storage.saveState(state);
+    return count;
+  } finally {
+    storage.releaseLock('state');
+  }
 }

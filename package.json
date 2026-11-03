@@ -4,8 +4,9 @@
   "private": true,
   "description": "RL Gym evaluation task for autonomous AI coding agents: Distributed Job Scheduler",
   "scripts": {
-    "build": "cd reference && npm run build && cd ../evaluation && npm run build",
-    "generate": "node ./evaluation/dist/src/generate_runner.js",
+    "postinstall": "npm --prefix reference install --silent",
+    "build": "npm --prefix reference run build && npm --prefix evaluation run build",
+    "generate": "node ./evaluation/dist/scripts/run_external_eval.js",
     "score": "node ./evaluation/dist/src/test_runner.js",
     "check:mutants": "node ./evaluation/dist/src/check_mutants.js",
     "check:reference": "node ./evaluation/dist/src/test_runner.js ./reference/dist/cli.js"

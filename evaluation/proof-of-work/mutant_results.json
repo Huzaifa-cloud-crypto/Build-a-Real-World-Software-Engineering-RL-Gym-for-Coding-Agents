@@ -1,0 +1,74 @@
+{
+  "timestamp": "2026-11-03T15:52:16.980Z",
+  "cleanScore": 1,
+  "total": 7,
+  "caught": 7,
+  "missed": 0,
+  "errored": 0,
+  "allCaught": true,
+  "results": [
+    {
+      "id": "MUT-001",
+      "name": "mutant_1_off_by_one_backoff",
+      "fault": "Math.pow(2, freshJob.attempts)",
+      "outcome": "CAUGHT",
+      "cleanScore": 1,
+      "mutatedScore": 0.8667,
+      "detail": "Verifier detected the fault."
+    },
+    {
+      "id": "MUT-002",
+      "name": "mutant_2_ignore_idempotency_on_retry",
+      "fault": "const idempotencyKey = null;",
+      "outcome": "CAUGHT",
+      "cleanScore": 1,
+      "mutatedScore": 0.85,
+      "detail": "Verifier detected the fault."
+    },
+    {
+      "id": "MUT-003",
+      "name": "mutant_3_heartbeat_resets_visibility_timeout_wrong",
+      "fault": "targetJob.lock_expires_at = new Date(now.getTime() - 10000).toISOString();",
+      "outcome": "CAUGHT",
+      "cleanScore": 1,
+      "mutatedScore": 0.9,
+      "detail": "Verifier detected the fault."
+    },
+    {
+      "id": "MUT-004",
+      "name": "mutant_4_extra_retry_before_dlq",
+      "fault": "freshJob.attempts > freshJob.max_retries",
+      "outcome": "CAUGHT",
+      "cleanScore": 1,
+      "mutatedScore": 0.7917,
+      "detail": "Verifier detected the fault."
+    },
+    {
+      "id": "MUT-005",
+      "name": "mutant_5_duplicate_claim_race_condition",
+      "fault": "if (job.state === 'failed' && job.lock_expires_at) {",
+      "outcome": "CAUGHT",
+      "cleanScore": 1,
+      "mutatedScore": 0.8,
+      "detail": "Verifier detected the fault."
+    },
+    {
+      "id": "MUT-006",
+      "name": "mutant_6_scheduled_job_lost_on_crash",
+      "fault": "if (!delayMs) { state.jobs[jobId] = newJob; }",
+      "outcome": "CAUGHT",
+      "cleanScore": 1,
+      "mutatedScore": 0.95,
+      "detail": "Verifier detected the fault."
+    },
+    {
+      "id": "MUT-007",
+      "name": "mutant_7_non_atomic_state_write",
+      "fault": "fs.copyFileSync(tempFile, this.stateFile);",
+      "outcome": "CAUGHT",
+      "cleanScore": 1,
+      "mutatedScore": 0.95,
+      "detail": "Verifier detected the fault."
+    }
+  ]
+}

@@ -2,6 +2,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { QueueState } from './types';
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 export function getReferenceTime(nowArg?: string): Date {
   if (nowArg) {
     const parsed = new Date(nowArg);
@@ -70,17 +74,34 @@ export class Storage {
     fs.appendFileSync(logFile, `${header}${message}\n`, 'utf-8');
   }
 
-  public acquireLock(lockName: string): boolean {
+  public acquireLock(lockName: string, staleMs: number = 30000): boolean {
     this.ensureDirs();
     const lockPath = path.join(this.locksDir, `${lockName}.lock`);
-    try {
-      const fd = fs.openSync(lockPath, 'wx');
-      fs.writeSync(fd, `${process.pid}`);
-      fs.closeSync(fd);
-      return true;
-    } catch {
-      return false;
+
+    for (let attempt = 0; attempt < 50; attempt++) {
+      try {
+        const fd = fs.openSync(lockPath, 'wx');
+        fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+        fs.closeSync(fd);
+        return true;
+      } catch (err: any) {
+        if (err.code !== 'EEXIST') return false;
+
+        // A SIGKILL'd worker leaves its lock file behind forever; steal it
+        // once it is older than staleMs so the queue cannot deadlock.
+        try {
+          const st = fs.statSync(lockPath);
+          if (Date.now() - st.mtimeMs > staleMs) {
+            try { fs.unlinkSync(lockPath); } catch { /* another worker won */ }
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        sleepSync(20);
+      }
     }
+    return false;
   }
 
   public releaseLock(lockName: string): void {

@@ -1,8 +1,7 @@
 {
-  "timestamp": "2026-10-11T10:14:03.778Z",
+  "timestamp": "2026-11-03T15:35:20.195Z",
   "target": "reference_solution",
   "score": 1,
-  "pass_rate": "100%",
   "details": [
     {
       "id": "CLI-001",
